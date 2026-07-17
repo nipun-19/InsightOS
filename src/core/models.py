@@ -1,125 +1,140 @@
-"""Plain dataclasses mirroring the SQLite schema (ARCHITECTURE.md §7).
+# src/core/models.py
+"""Plain dataclasses mirroring rows in the InsightOS SQLite schema.
 
-Per §6, this module contains ONLY data shapes — no SQL, no file I/O, no
-business logic. `core/database.py` is responsible for translating between
-sqlite3.Row objects and these dataclasses.
+These models carry data only — no SQL, no I/O, no formatting logic. Row
+parsing (``from_row``) is the single exception, since it is the natural
+boundary between raw ``sqlite3.Row`` objects and typed application data.
 """
 
+from __future__ import annotations
+
+import sqlite3
 from dataclasses import dataclass
+from typing import Optional
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class SystemEvent:
-    """Mirrors a row in the `system_events` table.
+    """A single lifecycle event: boot, shutdown, sleep, or wake.
 
-    Attributes:
-        id: Primary key. None for a not-yet-persisted instance.
-        event_type: One of "boot", "shutdown", "sleep", "wake".
-        timestamp: ISO8601 UTC timestamp of when the event occurred.
-        created_at: ISO8601 UTC timestamp of when the row was inserted.
+    :ivar id: Primary key, ``None`` until persisted.
+    :ivar event_type: One of ``"boot"``, ``"shutdown"``, ``"sleep"``, ``"wake"``.
+    :ivar timestamp: ISO8601 UTC instant the event occurred.
+    :ivar created_at: ISO8601 UTC instant the row was written.
     """
 
     event_type: str
     timestamp: str
-    id: int | None = None
-    created_at: str | None = None
+    id: Optional[int] = None
+    created_at: Optional[str] = None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "SystemEvent":
+        """Build a :class:`SystemEvent` from a ``system_events`` row."""
+        return cls(
+            id=row["id"],
+            event_type=row["event_type"],
+            timestamp=row["timestamp"],
+            created_at=row["created_at"],
+        )
 
 
-@dataclass(frozen=True)
+@dataclass(slots=True)
 class AppSession:
-    """Mirrors a row in the `app_sessions` table.
+    """A contiguous span of time a single application held the foreground.
 
-    Attributes:
-        id: Primary key. None for a not-yet-persisted instance.
-        app_name: Executable name, e.g. "chrome.exe".
-        window_title: Foreground window title at session start. Stored in
-            the database only — never written to the log file (§21).
-        start_time: ISO8601 UTC timestamp when the session began.
-        end_time: ISO8601 UTC timestamp when the session ended, or None if
-            this session is still active (the currently foregrounded app).
-        duration_seconds: Set once at close time; never recomputed later,
-            so a closed row stays correct even after a later crash (§7).
-        date: Local "YYYY-MM-DD" date the session started on.
+    :ivar app_name: Executable name, e.g. ``"chrome.exe"``.
+    :ivar window_title: Foreground window title at session start; database-only.
+    :ivar start_time: ISO8601 UTC start instant.
+    :ivar end_time: ISO8601 UTC end instant, or ``None`` if still active.
+    :ivar duration_seconds: Fixed at close-time; never recomputed later.
+    :ivar date: Local ``YYYY-MM-DD`` bucket the session belongs to.
     """
 
     app_name: str
     start_time: str
     date: str
-    id: int | None = None
-    window_title: str | None = None
-    end_time: str | None = None
-    duration_seconds: int | None = None
+    id: Optional[int] = None
+    window_title: Optional[str] = None
+    end_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
 
     @property
     def is_active(self) -> bool:
-        """Whether this session has no end_time yet (currently foregrounded).
-
-        Returns:
-            True if the session is still open.
-        """
+        """Return ``True`` when the session has not yet been closed."""
         return self.end_time is None
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "AppSession":
+        """Build an :class:`AppSession` from an ``app_sessions`` row."""
+        return cls(
+            id=row["id"],
+            app_name=row["app_name"],
+            window_title=row["window_title"],
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            duration_seconds=row["duration_seconds"],
+            date=row["date"],
+        )
 
-@dataclass(frozen=True)
+
+@dataclass(slots=True)
 class IdlePeriod:
-    """Mirrors a row in the `idle_periods` table.
+    """A contiguous span of time with no keyboard/mouse activity.
 
-    Attributes:
-        id: Primary key. None for a not-yet-persisted instance.
-        start_time: ISO8601 UTC timestamp when idling began.
-        end_time: ISO8601 UTC timestamp when idling ended, or None if the
-            user is still idle.
-        duration_seconds: Set once at close time; never recomputed later.
-        date: Local "YYYY-MM-DD" date the idle period started on.
+    :ivar start_time: ISO8601 UTC start instant.
+    :ivar end_time: ISO8601 UTC end instant, or ``None`` if still active.
+    :ivar duration_seconds: Fixed at close-time; never recomputed later.
+    :ivar date: Local ``YYYY-MM-DD`` bucket the idle period belongs to.
     """
 
     start_time: str
     date: str
-    id: int | None = None
-    end_time: str | None = None
-    duration_seconds: int | None = None
+    id: Optional[int] = None
+    end_time: Optional[str] = None
+    duration_seconds: Optional[int] = None
 
     @property
     def is_active(self) -> bool:
-        """Whether this idle period is still ongoing.
-
-        Returns:
-            True if the idle period has no end_time yet.
-        """
+        """Return ``True`` when the idle period has not yet been closed."""
         return self.end_time is None
 
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "IdlePeriod":
+        """Build an :class:`IdlePeriod` from an ``idle_periods`` row."""
+        return cls(
+            id=row["id"],
+            start_time=row["start_time"],
+            end_time=row["end_time"],
+            duration_seconds=row["duration_seconds"],
+            date=row["date"],
+        )
 
-@dataclass(frozen=True)
+
+@dataclass(slots=True)
 class DailySummary:
-    """Mirrors a row in the `daily_summary` table.
+    """Aggregate totals for a single local calendar date.
 
-    Attributes:
-        date: Local "YYYY-MM-DD" date; primary key.
-        total_screen_seconds: Cumulative active (non-idle) seconds for the day.
-        total_idle_seconds: Cumulative idle seconds for the day.
-        first_activity: ISO8601 UTC timestamp of the first tracked activity.
-        last_activity: ISO8601 UTC timestamp of the most recent tracked activity.
+    :ivar date: Local ``YYYY-MM-DD`` bucket, primary key.
+    :ivar total_screen_seconds: Sum of active (non-idle) foreground time.
+    :ivar total_idle_seconds: Sum of idle time.
+    :ivar first_activity: ISO8601 UTC instant of the day's first activity.
+    :ivar last_activity: ISO8601 UTC instant of the day's most recent activity.
     """
 
     date: str
     total_screen_seconds: int = 0
     total_idle_seconds: int = 0
-    first_activity: str | None = None
-    last_activity: str | None = None
+    first_activity: Optional[str] = None
+    last_activity: Optional[str] = None
 
-
-@dataclass(frozen=True)
-class AppUsage:
-    """Aggregated usage for a single app over some date range.
-
-    Not a DB table — this is the shape returned by database.py's
-    "top apps" queries, which GROUP BY app_name and SUM duration_seconds
-    across one or more `app_sessions` rows.
-
-    Attributes:
-        app_name: Executable name, e.g. "chrome.exe".
-        total_seconds: Summed duration across all matching sessions.
-    """
-
-    app_name: str
-    total_seconds: int
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DailySummary":
+        """Build a :class:`DailySummary` from a ``daily_summary`` row."""
+        return cls(
+            date=row["date"],
+            total_screen_seconds=row["total_screen_seconds"],
+            total_idle_seconds=row["total_idle_seconds"],
+            first_activity=row["first_activity"],
+            last_activity=row["last_activity"],
+        )

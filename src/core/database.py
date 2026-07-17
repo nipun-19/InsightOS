@@ -1,30 +1,29 @@
-"""SQLite access layer for InsightOS.
+# src/core/database.py
+"""SQLite persistence layer for InsightOS.
 
-Per ARCHITECTURE.md §6 (Engineering Rule #8): "Database queries must exist
-ONLY inside database.py." No other module may import sqlite3 or write raw
-SQL. This module owns connection management (thread-local, WAL mode),
-schema creation, and every CRUD/query operation used by the Tracker and UI.
-
-Threading (§16): each thread must use its own connection under WAL mode.
-get_connection() returns a thread-local connection, created lazily.
+This is the **only** file in the codebase permitted to contain SQL. It owns
+schema creation, migrations, and every read/write query. Thread-local
+connections make it safe to call from the Tracker thread and any UI thread
+concurrently under WAL mode, as required by the threading model.
 """
+
+from __future__ import annotations
 
 import sqlite3
 import threading
 import time
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Iterator, Optional
 
-import config
-from core.models import AppSession, AppUsage, DailySummary, IdlePeriod
-from utils import time_utils
-from utils.logger import get_logger
+from src import config
+from src.core.models import AppSession, DailySummary, IdlePeriod, SystemEvent
+from src.utils.logger import get_logger
+from src.utils.time_utils import parse_iso, utc_now_iso
 
 logger = get_logger(__name__)
 
-_local = threading.local()
-
 _SCHEMA_SQL = """
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = NORMAL;
 PRAGMA foreign_keys = ON;
 
 CREATE TABLE IF NOT EXISTS system_events (
@@ -70,287 +69,293 @@ CREATE TABLE IF NOT EXISTS schema_version (
 """
 
 
-def get_connection() -> sqlite3.Connection:
-    """Return this thread's SQLite connection, creating it on first use."""
-    connection = getattr(_local, "connection", None)
-    if connection is None:
-        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(
-            str(config.DB_PATH),
-            timeout=config.DB_BUSY_TIMEOUT_MS / 1000,
-            isolation_level=None,  # autocommit; transactions are single statements
-        )
-        connection.row_factory = sqlite3.Row
-        connection.execute(f"PRAGMA busy_timeout = {config.DB_BUSY_TIMEOUT_MS}")
-        _local.connection = connection
-    return connection
+class Database:
+    """Thread-safe SQLite gateway for all InsightOS persistence.
 
+    One :class:`Database` instance is shared process-wide; each thread that
+    calls into it receives its own private ``sqlite3.Connection`` via
+    :meth:`get_connection`, as required for safe concurrent WAL access.
+    """
 
-def init_db() -> None:
-    """Create the schema if missing and record the schema version. Idempotent."""
-    conn = get_connection()
-    conn.executescript(_SCHEMA_SQL)
-    row = conn.execute("SELECT version FROM schema_version LIMIT 1").fetchone()
-    if row is None:
-        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (config.SCHEMA_VERSION,))
-    logger.info("Database initialized at %s", config.DB_PATH)
+    def __init__(self, db_path: Path = config.DATABASE_PATH) -> None:
+        """Create the gateway and ensure the schema exists on disk.
 
+        :param db_path: Location of the SQLite file. Defaults to the
+            configured production path; tests may override it.
+        """
+        self._db_path = db_path
+        self._local = threading.local()
+        self._schema_lock = threading.Lock()
+        self._schema_ready = False
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ensure_schema()
 
-def checkpoint_and_close() -> None:
-    """Checkpoint the WAL file and close this thread's connection (§15)."""
-    connection = getattr(_local, "connection", None)
-    if connection is not None:
-        connection.execute("PRAGMA wal_checkpoint(FULL)")
-        connection.close()
-        _local.connection = None
-        logger.info("Database checkpointed and closed")
+    def get_connection(self) -> sqlite3.Connection:
+        """Return this thread's private, WAL-mode SQLite connection."""
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
+            conn = sqlite3.connect(
+                str(self._db_path),
+                timeout=config.DB_CONNECTION_TIMEOUT_SECONDS,
+                check_same_thread=False,
+            )
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            conn.execute("PRAGMA foreign_keys = ON")
+            self._local.connection = conn
+        return conn
 
-
-def _run_write(operation_name: str, fn) -> None:
-    """Run a write callable with the §20 retry policy: retry once on
-    sqlite3.OperationalError, then log and drop rather than crash."""
-    attempts = config.DB_WRITE_RETRY_ATTEMPTS + 1
-    for attempt in range(1, attempts + 1):
-        try:
-            fn()
-            return
-        except sqlite3.OperationalError as exc:
-            if attempt < attempts:
-                logger.warning(
-                    "DB write '%s' failed (attempt %d/%d): %s — retrying",
-                    operation_name, attempt, attempts, exc,
+    def _ensure_schema(self) -> None:
+        """Create tables/indexes and record the schema version, once."""
+        with self._schema_lock:
+            if self._schema_ready:
+                return
+            conn = self.get_connection()
+            conn.executescript(_SCHEMA_SQL)
+            row = conn.execute("SELECT version FROM schema_version").fetchone()
+            if row is None:
+                conn.execute(
+                    "INSERT INTO schema_version (version) VALUES (?)",
+                    (config.SCHEMA_VERSION,),
                 )
+            conn.commit()
+            self._schema_ready = True
+
+    @contextmanager
+    def _write(self) -> Iterator[sqlite3.Connection]:
+        """Context manager for a write operation with retry-on-lock.
+
+        Commits on success. On ``sqlite3.OperationalError`` (e.g. the
+        database is momentarily locked) it retries once after a short
+        backoff, then logs and swallows the failure rather than crashing
+        the caller, per the exception-handling strategy.
+        """
+        conn = self.get_connection()
+        attempts = config.DB_WRITE_RETRY_ATTEMPTS + 1
+        for attempt in range(1, attempts + 1):
+            try:
+                yield conn
+                conn.commit()
+                return
+            except sqlite3.OperationalError:
+                conn.rollback()
+                if attempt >= attempts:
+                    logger.warning("Dropping write after %d attempts", attempt, exc_info=True)
+                    return
+                logger.warning("Write failed (attempt %d), retrying", attempt, exc_info=True)
                 time.sleep(config.DB_WRITE_RETRY_BACKOFF_SECONDS)
-            else:
-                logger.warning(
-                    "DB write '%s' failed after %d attempts: %s — dropped",
-                    operation_name, attempts, exc,
-                )
+            except Exception:
+                conn.rollback()
+                raise
 
+    # ------------------------------------------------------------------
+    # system_events
+    # ------------------------------------------------------------------
 
-def log_system_event(event_type: str, timestamp: str | None = None) -> None:
-    """Insert a lifecycle event row (boot/shutdown/sleep/wake)."""
-    ts = timestamp or time_utils.utc_now_iso()
+    def log_system_event(self, event_type: str) -> None:
+        """Record a lifecycle event (boot, shutdown, sleep, or wake)."""
+        if event_type not in config.SYSTEM_EVENT_TYPES:
+            raise ValueError(f"Invalid event_type: {event_type!r}")
+        with self._write() as conn:
+            conn.execute(
+                "INSERT INTO system_events (event_type, timestamp) VALUES (?, ?)",
+                (event_type, utc_now_iso()),
+            )
 
-    def _write() -> None:
-        get_connection().execute(
-            "INSERT INTO system_events (event_type, timestamp) VALUES (?, ?)", (event_type, ts)
-        )
+    def get_recent_events(self, limit: int = 20) -> list[SystemEvent]:
+        """Return the most recent lifecycle events, newest first."""
+        conn = self.get_connection()
+        rows = conn.execute(
+            "SELECT * FROM system_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [SystemEvent.from_row(row) for row in rows]
 
-    _run_write("log_system_event", _write)
-    logger.info("System event logged: %s", event_type)
+    # ------------------------------------------------------------------
+    # app_sessions
+    # ------------------------------------------------------------------
 
+    def start_app_session(self, app_name: str, window_title: Optional[str], date: str) -> Optional[int]:
+        """Open a new active app session and return its row id."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT INTO app_sessions (app_name, window_title, start_time, date) "
+                "VALUES (?, ?, ?, ?)",
+                (app_name, window_title, utc_now_iso(), date),
+            )
+            return cursor.lastrowid
 
-def reconcile_orphaned_sessions() -> None:
-    """Close sessions/idle periods left open by a crash (§8): a row with
-    end_time IS NULL from a previous local date is closed at its own
-    start_time (zero duration) so stale data never inflates today's totals.
-    """
-    today = time_utils.today_str()
-    conn = get_connection()
+    def close_app_session(self, session_id: int, end_time: Optional[str] = None) -> None:
+        """Close an active app session, fixing its ``duration_seconds``."""
+        end = end_time or utc_now_iso()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT start_time FROM app_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return
+            duration = _elapsed_seconds(row["start_time"], end)
+            conn.execute(
+                "UPDATE app_sessions SET end_time = ?, duration_seconds = ? WHERE id = ?",
+                (end, duration, session_id),
+            )
 
-    orphaned_sessions = conn.execute(
-        "SELECT id, start_time FROM app_sessions WHERE end_time IS NULL AND date != ?", (today,)
-    ).fetchall()
-    for row in orphaned_sessions:
-        conn.execute(
-            "UPDATE app_sessions SET end_time = ?, duration_seconds = 0 WHERE id = ?",
-            (row["start_time"], row["id"]),
-        )
-
-    orphaned_idle = conn.execute(
-        "SELECT id, start_time FROM idle_periods WHERE end_time IS NULL AND date != ?", (today,)
-    ).fetchall()
-    for row in orphaned_idle:
-        conn.execute(
-            "UPDATE idle_periods SET end_time = ?, duration_seconds = 0 WHERE id = ?",
-            (row["start_time"], row["id"]),
-        )
-
-    if orphaned_sessions or orphaned_idle:
-        logger.info(
-            "Reconciled %d orphaned session(s), %d orphaned idle period(s)",
-            len(orphaned_sessions), len(orphaned_idle),
-        )
-
-
-def open_app_session(app_name: str, window_title: str | None, start_time: str, date: str) -> int:
-    """Insert a new open app session (end_time NULL). Returns the new row id."""
-    cursor = get_connection().execute(
-        "INSERT INTO app_sessions (app_name, window_title, start_time, date) VALUES (?, ?, ?, ?)",
-        (app_name, window_title, start_time, date),
-    )
-    return int(cursor.lastrowid)
-
-
-def close_app_session(session_id: int, end_time: str) -> None:
-    """Close an open app session, computing and freezing its duration."""
-    conn = get_connection()
-
-    def _write() -> None:
+    def get_active_session(self) -> Optional[AppSession]:
+        """Return the currently open app session, if any."""
+        conn = self.get_connection()
         row = conn.execute(
-            "SELECT start_time FROM app_sessions WHERE id = ?", (session_id,)
+            "SELECT * FROM app_sessions WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        if row is None:
-            return
-        duration = time_utils.seconds_between(row["start_time"], end_time)
-        conn.execute(
-            "UPDATE app_sessions SET end_time = ?, duration_seconds = ? WHERE id = ?",
-            (end_time, duration, session_id),
-        )
+        return AppSession.from_row(row) if row is not None else None
 
-    _run_write("close_app_session", _write)
+    def get_sessions_for_date(self, date: str) -> list[AppSession]:
+        """Return every app session recorded on ``date``, oldest first."""
+        conn = self.get_connection()
+        rows = conn.execute(
+            "SELECT * FROM app_sessions WHERE date = ? ORDER BY start_time ASC", (date,)
+        ).fetchall()
+        return [AppSession.from_row(row) for row in rows]
 
+    def get_top_apps(self, dates: list[str], limit: int = config.TOP_APPS_LIMIT) -> list[tuple[str, int]]:
+        """Return the top apps by total duration across ``dates``.
 
-def get_active_session() -> AppSession | None:
-    """Return the currently open app session, or None if nothing is active."""
-    row = get_connection().execute(
-        "SELECT * FROM app_sessions WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    return _row_to_app_session(row) if row else None
+        :return: List of ``(app_name, total_seconds)`` tuples, longest first.
+        """
+        if not dates:
+            return []
+        placeholders = ",".join("?" for _ in dates)
+        conn = self.get_connection()
+        rows = conn.execute(
+            f"SELECT app_name, SUM(duration_seconds) AS total "
+            f"FROM app_sessions WHERE date IN ({placeholders}) AND duration_seconds IS NOT NULL "
+            f"GROUP BY app_name ORDER BY total DESC LIMIT ?",
+            (*dates, limit),
+        ).fetchall()
+        return [(row["app_name"], row["total"]) for row in rows]
 
+    def reconcile_orphaned_sessions(self) -> None:
+        """Close any session/idle rows left open by a previous crash.
 
-def open_idle_period(start_time: str, date: str) -> int:
-    """Insert a new open idle period (end_time NULL). Returns the new row id."""
-    cursor = get_connection().execute(
-        "INSERT INTO idle_periods (start_time, date) VALUES (?, ?)", (start_time, date)
-    )
-    return int(cursor.lastrowid)
+        Uses each row's own ``start_time`` as its end, so a crash never
+        inflates the following day's totals with stale open rows.
+        """
+        with self._write() as conn:
+            for table in ("app_sessions", "idle_periods"):
+                rows = conn.execute(
+                    f"SELECT id, start_time FROM {table} WHERE end_time IS NULL"
+                ).fetchall()
+                for row in rows:
+                    conn.execute(
+                        f"UPDATE {table} SET end_time = ?, duration_seconds = 0 WHERE id = ?",
+                        (row["start_time"], row["id"]),
+                    )
 
+    # ------------------------------------------------------------------
+    # idle_periods
+    # ------------------------------------------------------------------
 
-def close_idle_period(idle_id: int, end_time: str) -> None:
-    """Close an open idle period, computing and freezing its duration."""
-    conn = get_connection()
+    def start_idle_period(self, date: str) -> Optional[int]:
+        """Open a new active idle period and return its row id."""
+        with self._write() as conn:
+            cursor = conn.execute(
+                "INSERT INTO idle_periods (start_time, date) VALUES (?, ?)",
+                (utc_now_iso(), date),
+            )
+            return cursor.lastrowid
 
-    def _write() -> None:
+    def close_idle_period(self, idle_id: int, end_time: Optional[str] = None) -> None:
+        """Close an active idle period, fixing its ``duration_seconds``."""
+        end = end_time or utc_now_iso()
+        with self._write() as conn:
+            row = conn.execute(
+                "SELECT start_time FROM idle_periods WHERE id = ?", (idle_id,)
+            ).fetchone()
+            if row is None:
+                return
+            duration = _elapsed_seconds(row["start_time"], end)
+            conn.execute(
+                "UPDATE idle_periods SET end_time = ?, duration_seconds = ? WHERE id = ?",
+                (end, duration, idle_id),
+            )
+
+    def get_active_idle_period(self) -> Optional[IdlePeriod]:
+        """Return the currently open idle period, if any."""
+        conn = self.get_connection()
         row = conn.execute(
-            "SELECT start_time FROM idle_periods WHERE id = ?", (idle_id,)
+            "SELECT * FROM idle_periods WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
         ).fetchone()
-        if row is None:
+        return IdlePeriod.from_row(row) if row is not None else None
+
+    # ------------------------------------------------------------------
+    # daily_summary
+    # ------------------------------------------------------------------
+
+    def upsert_daily_summary(
+        self,
+        date: str,
+        screen_seconds_delta: int = 0,
+        idle_seconds_delta: int = 0,
+        activity_timestamp: Optional[str] = None,
+    ) -> None:
+        """Add deltas to a date's running totals, creating the row if needed."""
+        timestamp = activity_timestamp or utc_now_iso()
+        with self._write() as conn:
+            conn.execute(
+                """
+                INSERT INTO daily_summary
+                    (date, total_screen_seconds, total_idle_seconds, first_activity, last_activity)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(date) DO UPDATE SET
+                    total_screen_seconds = total_screen_seconds + excluded.total_screen_seconds,
+                    total_idle_seconds = total_idle_seconds + excluded.total_idle_seconds,
+                    last_activity = excluded.last_activity
+                """,
+                (date, screen_seconds_delta, idle_seconds_delta, timestamp, timestamp),
+            )
+
+    def get_daily_summary(self, date: str) -> Optional[DailySummary]:
+        """Return the aggregate totals for a single date, if recorded."""
+        conn = self.get_connection()
+        row = conn.execute(
+            "SELECT * FROM daily_summary WHERE date = ?", (date,)
+        ).fetchone()
+        return DailySummary.from_row(row) if row is not None else None
+
+    def get_summaries_range(self, dates: list[str]) -> list[DailySummary]:
+        """Return the aggregate totals for each date in ``dates``, in order."""
+        conn = self.get_connection()
+        summaries: dict[str, DailySummary] = {}
+        if dates:
+            placeholders = ",".join("?" for _ in dates)
+            rows = conn.execute(
+                f"SELECT * FROM daily_summary WHERE date IN ({placeholders})", dates
+            ).fetchall()
+            summaries = {row["date"]: DailySummary.from_row(row) for row in rows}
+        return [summaries.get(date, DailySummary(date=date)) for date in dates]
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def checkpoint_and_close(self) -> None:
+        """Flush the WAL file and close this thread's connection cleanly.
+
+        Called during shutdown, after the tracker has stopped writing.
+        """
+        conn = getattr(self._local, "connection", None)
+        if conn is None:
             return
-        duration = time_utils.seconds_between(row["start_time"], end_time)
-        conn.execute(
-            "UPDATE idle_periods SET end_time = ?, duration_seconds = ? WHERE id = ?",
-            (end_time, duration, idle_id),
-        )
-
-    _run_write("close_idle_period", _write)
-
-
-def get_active_idle_period() -> IdlePeriod | None:
-    """Return the currently open idle period, or None if the user isn't idle."""
-    row = get_connection().execute(
-        "SELECT * FROM idle_periods WHERE end_time IS NULL ORDER BY id DESC LIMIT 1"
-    ).fetchone()
-    return _row_to_idle_period(row) if row else None
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.commit()
+        except sqlite3.OperationalError:
+            logger.warning("WAL checkpoint failed during shutdown", exc_info=True)
+        finally:
+            conn.close()
+            self._local.connection = None
 
 
-def upsert_daily_summary(
-    date: str, screen_delta: int = 0, idle_delta: int = 0, activity_time: str | None = None
-) -> None:
-    """Increment today's summary row (creating it if needed) by the given deltas."""
-    conn = get_connection()
-
-    def _write() -> None:
-        conn.execute(
-            "INSERT OR IGNORE INTO daily_summary (date, first_activity) VALUES (?, ?)",
-            (date, activity_time),
-        )
-        conn.execute(
-            """
-            UPDATE daily_summary
-            SET total_screen_seconds = total_screen_seconds + ?,
-                total_idle_seconds = total_idle_seconds + ?,
-                last_activity = COALESCE(?, last_activity),
-                first_activity = COALESCE(first_activity, ?)
-            WHERE date = ?
-            """,
-            (screen_delta, idle_delta, activity_time, activity_time, date),
-        )
-
-    _run_write("upsert_daily_summary", _write)
-
-
-def get_today_summary(date: str) -> DailySummary:
-    """Fetch the daily_summary row for a date (zeroed if none exists yet)."""
-    row = get_connection().execute("SELECT * FROM daily_summary WHERE date = ?", (date,)).fetchone()
-    if row is None:
-        return DailySummary(date=date)
-    return DailySummary(
-        date=row["date"],
-        total_screen_seconds=row["total_screen_seconds"],
-        total_idle_seconds=row["total_idle_seconds"],
-        first_activity=row["first_activity"],
-        last_activity=row["last_activity"],
-    )
-
-
-def get_daily_summaries(dates: list[str]) -> list[DailySummary]:
-    """Fetch one DailySummary per requested date, preserving input order,
-    zeroed for any date with no row yet. Used for history bar charts (§12)."""
-    if not dates:
-        return []
-    placeholders = ",".join("?" for _ in dates)
-    rows = get_connection().execute(
-        f"SELECT * FROM daily_summary WHERE date IN ({placeholders})", dates
-    ).fetchall()
-    by_date = {row["date"]: row for row in rows}
-    return [
-        DailySummary(
-            date=d,
-            total_screen_seconds=by_date[d]["total_screen_seconds"] if d in by_date else 0,
-            total_idle_seconds=by_date[d]["total_idle_seconds"] if d in by_date else 0,
-            first_activity=by_date[d]["first_activity"] if d in by_date else None,
-            last_activity=by_date[d]["last_activity"] if d in by_date else None,
-        )
-        for d in dates
-    ]
-
-
-def get_top_apps(dates: list[str], limit: int = config.TOP_APPS_COUNT) -> list[AppUsage]:
-    """Return the top apps by total closed-session duration over a date range.
-
-    Only counts closed sessions (duration_seconds NOT NULL); callers needing
-    a live "today" total must add the active session's elapsed time themselves.
-    """
-    if not dates:
-        return []
-    placeholders = ",".join("?" for _ in dates)
-    rows = get_connection().execute(
-        f"""
-        SELECT app_name, SUM(duration_seconds) AS total_seconds
-        FROM app_sessions
-        WHERE date IN ({placeholders}) AND duration_seconds IS NOT NULL
-        GROUP BY app_name
-        ORDER BY total_seconds DESC
-        LIMIT ?
-        """,
-        (*dates, limit),
-    ).fetchall()
-    return [AppUsage(app_name=row["app_name"], total_seconds=row["total_seconds"]) for row in rows]
-
-
-def get_sessions_for_date(date: str) -> list[AppSession]:
-    """Return every app session for a date, ordered by start time — used for
-    the Today tab's Daily Timeline segmented strip (§12)."""
-    rows = get_connection().execute(
-        "SELECT * FROM app_sessions WHERE date = ? ORDER BY start_time ASC", (date,)
-    ).fetchall()
-    return [_row_to_app_session(row) for row in rows]
-
-
-def _row_to_app_session(row: sqlite3.Row) -> AppSession:
-    """Convert a sqlite3.Row from app_sessions into an AppSession."""
-    return AppSession(
-        id=row["id"], app_name=row["app_name"], window_title=row["window_title"],
-        start_time=row["start_time"], end_time=row["end_time"],
-        duration_seconds=row["duration_seconds"], date=row["date"],
-    )
-
-
-def _row_to_idle_period(row: sqlite3.Row) -> IdlePeriod:
-    """Convert a sqlite3.Row from idle_periods into an IdlePeriod."""
-    return IdlePeriod(
-        id=row["id"], start_time=row["start_time"], end_time=row["end_time"],
-        duration_seconds=row["duration_seconds"], date=row["date"],
-    )
+def _elapsed_seconds(start_iso: str, end_iso: str) -> int:
+    """Return whole seconds between two ISO8601 timestamps, floored at zero."""
+    delta = parse_iso(end_iso) - parse_iso(start_iso)
+    return max(0, int(delta.total_seconds()))
