@@ -1,3 +1,4 @@
+# system_tray.py
 """System tray icon and menu — the persistent anchor of InsightOS (§10).
 
 As long as the tray icon exists, the app is running. This is the only
@@ -17,10 +18,12 @@ from PySide6.QtCore import QTimer
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtWidgets import QApplication, QMenu, QMessageBox, QSystemTrayIcon
 
-import config
-from core import database as db
-from utils import settings_store, time_utils
-from utils.logger import get_logger
+from src.ui.toasts import show_toast
+
+from src import config
+from src.core import database as db
+from src.utils import settings_store, time_utils
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
@@ -36,7 +39,7 @@ class SystemTray(QSystemTrayIcon):
             on_exit: Callback invoked after the user confirms "Exit
                 InsightOS" — main.py wires this to the shutdown sequence.
         """
-        super().__init__(QIcon(str(config.TRAY_ICON_PATH)))
+        super().__init__(self._build_tray_icon())
         self._app = app
         self._on_exit = on_exit
         self._dashboard_window = None
@@ -47,7 +50,7 @@ class SystemTray(QSystemTrayIcon):
         self.activated.connect(self._on_activated)
 
         self._refresh_timer = QTimer()
-        self._refresh_timer.setInterval(config.TRAY_LABEL_REFRESH_INTERVAL_SECONDS * 1000)
+        self._refresh_timer.setInterval(config.TRAY_TOOLTIP_REFRESH_INTERVAL_SECONDS * 1000)
         self._refresh_timer.timeout.connect(self._refresh_label)
         self._refresh_timer.start()
         self._refresh_label()
@@ -55,9 +58,25 @@ class SystemTray(QSystemTrayIcon):
         self.setVisible(True)
         logger.info("System tray initialized")
 
+    def _build_tray_icon(self) -> QIcon:
+        """Return the branded tray icon, falling back to the PNG asset if needed."""
+        for icon_path in (config.TRAY_ICON_PATH, getattr(config, "TRAY_FALLBACK_ICON_PATH", None)):
+            if icon_path is None:
+                continue
+            if icon_path.exists() and icon_path.is_file():
+                icon = QIcon(str(icon_path))
+                if not icon.isNull():
+                    return icon
+        return QIcon()
+
     def _build_menu(self) -> None:
         """Construct the tray context menu described in ARCHITECTURE.md §10."""
         menu = QMenu()
+        menu.setStyleSheet(
+            "QMenu { background-color: #ffffff; border: 1px solid rgba(15, 23, 42, 0.08); border-radius: 12px; padding: 6px; }"
+            "QMenu::item { padding: 8px 12px; border-radius: 8px; }"
+            "QMenu::item:selected { background-color: rgba(37, 99, 235, 0.10); color: #0f172a; }"
+        )
 
         open_action = QAction("Open Dashboard", menu)
         open_action.triggered.connect(self._open_dashboard)
@@ -76,6 +95,10 @@ class SystemTray(QSystemTrayIcon):
         menu.addAction(self._today_label_action)
 
         menu.addSeparator()
+
+        settings_action = QAction("Settings", menu)
+        settings_action.triggered.connect(self._open_settings)
+        menu.addAction(settings_action)
 
         update_action = QAction("Check for Updates", menu)
         update_action.triggered.connect(self._check_for_updates)
@@ -96,7 +119,7 @@ class SystemTray(QSystemTrayIcon):
     def _refresh_label(self) -> None:
         """Refresh the tooltip and the disabled "Today: …" menu label.
 
-        Throttled to config.TRAY_LABEL_REFRESH_INTERVAL_SECONDS (§10, §19),
+        Throttled to config.TRAY_TOOLTIP_REFRESH_INTERVAL_SECONDS (§10, §19),
         decoupled from the tracker's own polling interval.
         """
         today = time_utils.today_str()
@@ -115,7 +138,7 @@ class SystemTray(QSystemTrayIcon):
         Per §9, Dashboard windows are destroyed on close, so a fresh
         instance is created if the previous one was closed.
         """
-        from ui.dashboard.dashboard_window import DashboardWindow  # lazy: avoid UI import cycle
+        from src.ui.dashboard.dashboard_window import DashboardWindow  # lazy: avoid UI import cycle
 
         if self._dashboard_window is None:
             self._dashboard_window = DashboardWindow()
@@ -134,10 +157,11 @@ class SystemTray(QSystemTrayIcon):
         Per §11, the widget is hidden (not destroyed) on close, so it's
         created once and reused for the app's lifetime.
         """
-        from ui.desktop_widget import DesktopWidget  # lazy: avoid UI import cycle
+        from src.ui.desktop_widget import DesktopWidget  # lazy: avoid UI import cycle
 
         if self._desktop_widget is None:
             self._desktop_widget = DesktopWidget()
+            self._app.desktop_widget = self._desktop_widget
 
         if checked:
             self._desktop_widget.show()
@@ -145,11 +169,22 @@ class SystemTray(QSystemTrayIcon):
             self._desktop_widget.hide()
         settings_store.set_value("widget_visible", checked)
 
+    def _open_settings(self) -> None:
+        """Open the polished settings dialog."""
+        from src.ui.settings_dialog import SettingsDialog
+
+        dialog = SettingsDialog()
+        dialog.show()
+        dialog.raise_()
+        dialog.activateWindow()
+        show_toast("Settings updated", "Your preferences were saved.")
+
     def _check_for_updates(self) -> None:
         """Trigger a manual update check, bypassing the 24h automatic timer."""
-        from services import updater  # lazy: updater is the only network-capable module
+        from src.services import updater  # lazy: updater is the only network-capable module
 
         updater.check_for_updates(force=True)
+        show_toast("Update check started", "InsightOS is checking for the latest release.")
 
     def _confirm_exit(self) -> None:
         """Show the exit confirmation dialog and invoke on_exit if accepted."""

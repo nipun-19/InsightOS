@@ -138,3 +138,11 @@ class DailySummary:
             first_activity=row["first_activity"],
             last_activity=row["last_activity"],
         )
+
+
+@dataclass(slots=True)
+class AppUsage:
+    """A simple aggregate row for top-app usage summaries."""
+
+    app_name: str
+    total_seconds: int

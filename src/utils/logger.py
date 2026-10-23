@@ -19,43 +19,49 @@ sequence, before any other module logs anything.
 
 import logging
 import logging.handlers
+import sys
 from pathlib import Path
 
-import config
+from src import config
 
 
 def configure_logging(level: str = config.LOG_DEFAULT_LEVEL) -> None:
-    """Configure the root logger with a rotating file handler.
-
-    Idempotent: calling this more than once will not duplicate handlers,
-    so it is safe to call defensively from tests or tools.
-
-    Args:
-        level: Logging level name (e.g. "INFO", "WARNING", "ERROR").
-
-    Returns:
-        None.
-    """
+    """Configure the root logger with file and console handlers."""
     root_logger = logging.getLogger()
-
-    if root_logger.handlers:
-        return  # Already configured — avoid duplicate handlers.
 
     root_logger.setLevel(level)
 
     log_dir: Path = config.LOG_FILE_PATH.parent
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    file_handler = logging.handlers.RotatingFileHandler(
-        filename=str(config.LOG_FILE_PATH),
-        maxBytes=config.LOG_MAX_BYTES,
-        backupCount=config.LOG_BACKUP_COUNT,
-        encoding="utf-8",
-    )
-    formatter = logging.Formatter(fmt=config.LOG_FORMAT, datefmt=config.LOG_DATE_FORMAT)
-    file_handler.setFormatter(formatter)
+    file_handler = None
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.handlers.RotatingFileHandler):
+            file_handler = handler
+            break
 
-    root_logger.addHandler(file_handler)
+    if file_handler is None:
+        file_handler = logging.handlers.RotatingFileHandler(
+            filename=str(config.LOG_FILE_PATH),
+            maxBytes=config.LOG_MAX_BYTES,
+            backupCount=config.LOG_BACKUP_COUNT,
+            encoding="utf-8",
+        )
+        formatter = logging.Formatter(fmt=config.LOG_FORMAT, datefmt=config.LOG_DATE_FORMAT)
+        file_handler.setFormatter(formatter)
+        root_logger.addHandler(file_handler)
+
+    console_handler = None
+    for handler in root_logger.handlers:
+        if isinstance(handler, logging.StreamHandler) and not isinstance(handler, logging.handlers.RotatingFileHandler):
+            console_handler = handler
+            break
+
+    if console_handler is None:
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(getattr(config, "LOG_CONSOLE_LEVEL", "INFO"))
+        console_handler.setFormatter(logging.Formatter(fmt=config.LOG_FORMAT, datefmt=config.LOG_DATE_FORMAT))
+        root_logger.addHandler(console_handler)
 
 
 def get_logger(name: str) -> logging.Logger:

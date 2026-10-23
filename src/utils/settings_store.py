@@ -1,3 +1,4 @@
+# settings_store.py
 """Local settings.json read/write for InsightOS.
 
 Per ARCHITECTURE.md §6, this module owns app configuration — widget
@@ -8,18 +9,25 @@ local app state.
 """
 
 import json
+import os
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
-import config
-from utils.logger import get_logger
+from src import config
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 _DEFAULTS: dict[str, Any] = {
+    "widget_enabled": True,
     "widget_visible": True,
     "widget_x": config.WIDGET_DEFAULT_X,
     "widget_y": config.WIDGET_DEFAULT_Y,
+    "widget_opacity": 0.96,
+    "widget_compact_mode": False,
+    "widget_auto_start": False,
+    "theme": "light",
     "last_update_check": None,
 }
 
@@ -44,6 +52,10 @@ def load_settings() -> dict[str, Any]:
         logger.warning("Failed to read settings.json (%s) — using defaults", exc)
         return dict(_DEFAULTS)
 
+    if not isinstance(data, dict):
+        logger.warning("settings.json did not contain a JSON object — using defaults")
+        return dict(_DEFAULTS)
+
     merged = dict(_DEFAULTS)
     merged.update(data)
     return merged
@@ -51,6 +63,10 @@ def load_settings() -> dict[str, Any]:
 
 def save_settings(settings: dict[str, Any]) -> None:
     """Persist a settings dict to settings.json, creating data/ if needed.
+
+    The write is atomic: a temporary file is written beside the final path and
+    replaced only after it is complete, so corrupted or partially-written JSON
+    does not replace a valid settings file during an interrupted save.
 
     Args:
         settings: The full settings dict to write (typically load_settings()
@@ -62,10 +78,15 @@ def save_settings(settings: dict[str, Any]) -> None:
     path: Path = config.SETTINGS_FILE_PATH
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("w", encoding="utf-8") as f:
-            json.dump(settings, f, indent=2, sort_keys=True)
+        payload = json.dumps(settings, indent=2, sort_keys=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=str(path.parent), delete=False) as handle:
+            handle.write(payload)
+            temp_path = Path(handle.name)
+        os.replace(temp_path, path)
     except OSError as exc:
         logger.warning("Failed to write settings.json: %s", exc)
+    except Exception:  # noqa: BLE001
+        logger.warning("Unexpected error while writing settings.json", exc_info=True)
 
 
 def get_value(key: str) -> Any:

@@ -1,0 +1,50 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+
+# SQLite
+*.db
+*.db-shm
+*.db-wal
+
+# Build
+build/
+dist/
+*.spec
+
+# Testing
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+
+# Coverage
+.coverage
+htmlcov/
+# InsightOS local user state
+/data/settings.json
+/data/startup_state.json
+
+# Local debugging probes and logs
+/_db_probe.py
+/_foreground_probe.py
+/debug_qfont.err
+/debug_qfont.out
+
+# Separate website project
+/website/

@@ -9,12 +9,13 @@ concurrently under WAL mode, as required by the threading model.
 
 from __future__ import annotations
 
+import csv
+import json
 import sqlite3
 import threading
 import time
-from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional
+from typing import Optional
 
 from src import config
 from src.core.models import AppSession, DailySummary, IdlePeriod, SystemEvent
@@ -122,32 +123,14 @@ class Database:
             conn.commit()
             self._schema_ready = True
 
-    @contextmanager
-    def _write(self) -> Iterator[sqlite3.Connection]:
-        """Context manager for a write operation with retry-on-lock.
+    def _write(self):
+        """Return a transaction context that commits on success and rolls back on failure.
 
-        Commits on success. On ``sqlite3.OperationalError`` (e.g. the
-        database is momentarily locked) it retries once after a short
-        backoff, then logs and swallows the failure rather than crashing
-        the caller, per the exception-handling strategy.
+        SQLite errors are never silently swallowed here; a failure propagates to
+        the caller so tracking can fail safely without pretending the write
+        succeeded.
         """
-        conn = self.get_connection()
-        attempts = config.DB_WRITE_RETRY_ATTEMPTS + 1
-        for attempt in range(1, attempts + 1):
-            try:
-                yield conn
-                conn.commit()
-                return
-            except sqlite3.OperationalError:
-                conn.rollback()
-                if attempt >= attempts:
-                    logger.warning("Dropping write after %d attempts", attempt, exc_info=True)
-                    return
-                logger.warning("Write failed (attempt %d), retrying", attempt, exc_info=True)
-                time.sleep(config.DB_WRITE_RETRY_BACKOFF_SECONDS)
-            except Exception:
-                conn.rollback()
-                raise
+        return _WriteTransaction(self)
 
     # ------------------------------------------------------------------
     # system_events
@@ -175,17 +158,24 @@ class Database:
     # app_sessions
     # ------------------------------------------------------------------
 
-    def start_app_session(self, app_name: str, window_title: Optional[str], date: str) -> Optional[int]:
+    def start_app_session(
+        self, app_name: str, window_title: Optional[str], start_time: str, date: str
+    ) -> Optional[int]:
         """Open a new active app session and return its row id."""
         with self._write() as conn:
             cursor = conn.execute(
                 "INSERT INTO app_sessions (app_name, window_title, start_time, date) "
                 "VALUES (?, ?, ?, ?)",
-                (app_name, window_title, utc_now_iso(), date),
+                (app_name, window_title, start_time, date),
             )
             return cursor.lastrowid
 
-    def close_app_session(self, session_id: int, end_time: Optional[str] = None) -> None:
+    def close_app_session(
+        self,
+        session_id: int,
+        end_time: Optional[str] = None,
+        duration_seconds: Optional[int] = None,
+    ) -> None:
         """Close an active app session, fixing its ``duration_seconds``."""
         end = end_time or utc_now_iso()
         with self._write() as conn:
@@ -194,7 +184,7 @@ class Database:
             ).fetchone()
             if row is None:
                 return
-            duration = _elapsed_seconds(row["start_time"], end)
+            duration = duration_seconds if duration_seconds is not None else _elapsed_seconds(row["start_time"], end)
             conn.execute(
                 "UPDATE app_sessions SET end_time = ?, duration_seconds = ? WHERE id = ?",
                 (end, duration, session_id),
@@ -214,6 +204,38 @@ class Database:
         rows = conn.execute(
             "SELECT * FROM app_sessions WHERE date = ? ORDER BY start_time ASC", (date,)
         ).fetchall()
+        return [AppSession.from_row(row) for row in rows]
+
+    def get_sessions_for_dates(self, dates: list[str]) -> list[AppSession]:
+        """Return every app session recorded in the provided date buckets."""
+        if not dates:
+            return []
+        placeholders = ",".join("?" for _ in dates)
+        conn = self.get_connection()
+        rows = conn.execute(
+            f"SELECT * FROM app_sessions WHERE date IN ({placeholders}) ORDER BY start_time ASC",
+            dates,
+        ).fetchall()
+        return [AppSession.from_row(row) for row in rows]
+
+    def search_sessions(self, query: str, dates: list[str] | None = None) -> list[AppSession]:
+        """Return sessions whose app name or window title contains the query."""
+        if not query.strip():
+            return self.get_sessions_for_dates(dates or [])
+        pattern = f"%{query.strip()}%"
+        if dates:
+            placeholders = ",".join("?" for _ in dates)
+            conn = self.get_connection()
+            rows = conn.execute(
+                f"SELECT * FROM app_sessions WHERE date IN ({placeholders}) AND (app_name LIKE ? OR window_title LIKE ?) ORDER BY start_time ASC",
+                [*dates, pattern, pattern],
+            ).fetchall()
+        else:
+            conn = self.get_connection()
+            rows = conn.execute(
+                "SELECT * FROM app_sessions WHERE app_name LIKE ? OR window_title LIKE ? ORDER BY start_time ASC",
+                (pattern, pattern),
+            ).fetchall()
         return [AppSession.from_row(row) for row in rows]
 
     def get_top_apps(self, dates: list[str], limit: int = config.TOP_APPS_LIMIT) -> list[tuple[str, int]]:
@@ -254,12 +276,12 @@ class Database:
     # idle_periods
     # ------------------------------------------------------------------
 
-    def start_idle_period(self, date: str) -> Optional[int]:
+    def start_idle_period(self, start_time: str, date: str) -> Optional[int]:
         """Open a new active idle period and return its row id."""
         with self._write() as conn:
             cursor = conn.execute(
                 "INSERT INTO idle_periods (start_time, date) VALUES (?, ?)",
-                (utc_now_iso(), date),
+                (start_time, date),
             )
             return cursor.lastrowid
 
@@ -333,6 +355,74 @@ class Database:
             summaries = {row["date"]: DailySummary.from_row(row) for row in rows}
         return [summaries.get(date, DailySummary(date=date)) for date in dates]
 
+    def get_history_stats(self, dates: list[str]) -> dict[str, int]:
+        """Return a compact set of factual statistics for the provided date range."""
+        if not dates:
+            return {}
+        placeholders = ",".join("?" for _ in dates)
+        conn = self.get_connection()
+        total_sessions = conn.execute(
+            f"SELECT COUNT(*) AS count FROM app_sessions WHERE date IN ({placeholders})",
+            dates,
+        ).fetchone()["count"]
+        total_seconds = conn.execute(
+            f"SELECT COALESCE(SUM(duration_seconds), 0) AS total FROM app_sessions WHERE date IN ({placeholders}) AND duration_seconds IS NOT NULL",
+            dates,
+        ).fetchone()["total"]
+        app_count = conn.execute(
+            f"SELECT COUNT(DISTINCT app_name) AS count FROM app_sessions WHERE date IN ({placeholders})",
+            dates,
+        ).fetchone()["count"]
+        longest = conn.execute(
+            f"SELECT MAX(duration_seconds) AS value FROM app_sessions WHERE date IN ({placeholders}) AND duration_seconds IS NOT NULL",
+            dates,
+        ).fetchone()["value"] or 0
+        return {
+            "total_sessions": int(total_sessions),
+            "total_seconds": int(total_seconds),
+            "unique_apps": int(app_count),
+            "longest_session_seconds": int(longest),
+        }
+
+    def export_history_csv(self, dates: list[str], target_path: str) -> None:
+        """Export tracked sessions for the supplied date range to CSV."""
+        sessions = self.get_sessions_for_dates(dates)
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(target_path, "w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["id", "app_name", "window_title", "start_time", "end_time", "duration_seconds", "date"])
+            writer.writeheader()
+            for session in sessions:
+                writer.writerow({
+                    "id": session.id,
+                    "app_name": session.app_name,
+                    "window_title": session.window_title or "",
+                    "start_time": session.start_time,
+                    "end_time": session.end_time or "",
+                    "duration_seconds": session.duration_seconds or 0,
+                    "date": session.date,
+                })
+
+    def export_history_json(self, dates: list[str], target_path: str) -> None:
+        """Export tracked sessions for the supplied date range to JSON."""
+        sessions = self.get_sessions_for_dates(dates)
+        Path(target_path).parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "sessions": [
+                {
+                    "id": session.id,
+                    "app_name": session.app_name,
+                    "window_title": session.window_title,
+                    "start_time": session.start_time,
+                    "end_time": session.end_time,
+                    "duration_seconds": session.duration_seconds,
+                    "date": session.date,
+                }
+                for session in sessions
+            ]
+        }
+        with open(target_path, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -355,7 +445,126 @@ class Database:
             self._local.connection = None
 
 
+class _WriteTransaction:
+    """Simple transactional wrapper for SQLite writes."""
+
+    def __init__(self, database: "Database") -> None:
+        self._database = database
+        self._conn: sqlite3.Connection | None = None
+
+    def __enter__(self) -> sqlite3.Connection:
+        self._conn = self._database.get_connection()
+        return self._conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if self._conn is None:
+            return False
+        if exc_type is None:
+            try:
+                self._conn.commit()
+                return False
+            except sqlite3.OperationalError:
+                self._conn.rollback()
+                logger.error("Database commit failed", exc_info=(exc_type, exc_val, exc_tb))
+                raise
+        self._conn.rollback()
+        return False
+
+
 def _elapsed_seconds(start_iso: str, end_iso: str) -> int:
     """Return whole seconds between two ISO8601 timestamps, floored at zero."""
     delta = parse_iso(end_iso) - parse_iso(start_iso)
     return max(0, int(delta.total_seconds()))
+
+
+# Module-level public API — tracker.py, main.py, desktop_widget.py, and
+# system_tray.py call functions directly on this module rather than
+# instantiating Database themselves. Backed by a lazy singleton.
+
+_db_instance: Optional[Database] = None
+_db_instance_lock = threading.Lock()
+
+
+def _get_db() -> Database:
+    """Return the process-wide Database singleton, creating it once."""
+    global _db_instance
+    if _db_instance is None:
+        with _db_instance_lock:
+            if _db_instance is None:
+                _db_instance = Database()
+    return _db_instance
+
+def init_db() -> None:
+    """Ensure the database singleton and schema are initialized (§9)."""
+    _get_db()
+
+def log_system_event(event_type: str) -> None:
+    """See :meth:`Database.log_system_event`."""
+    _get_db().log_system_event(event_type)
+
+def open_app_session(app_name: str, window_title: Optional[str], start_time: str, date: str) -> Optional[int]:
+    """See :meth:`Database.start_app_session`."""
+    return _get_db().start_app_session(app_name, window_title, start_time, date)
+
+def close_app_session(
+    session_id: int, end_time: Optional[str] = None, duration_seconds: Optional[int] = None
+) -> None:
+    """See :meth:`Database.close_app_session`."""
+    _get_db().close_app_session(session_id, end_time, duration_seconds)
+
+def open_idle_period(start_time: str, date: str) -> Optional[int]:
+    """See :meth:`Database.start_idle_period`."""
+    return _get_db().start_idle_period(start_time, date)
+
+def close_idle_period(idle_id: int, end_time: Optional[str] = None) -> None:
+    """See :meth:`Database.close_idle_period`."""
+    _get_db().close_idle_period(idle_id, end_time)
+
+def upsert_daily_summary(
+    date: str, screen_delta: int = 0, idle_delta: int = 0, activity_time: Optional[str] = None
+) -> None:
+    """See :meth:`Database.upsert_daily_summary`."""
+    _get_db().upsert_daily_summary(
+        date, screen_seconds_delta=screen_delta, idle_seconds_delta=idle_delta, activity_timestamp=activity_time
+    )
+
+def get_today_summary(date: str) -> DailySummary:
+    """Return totals for ``date``; an all-zero DailySummary if none recorded."""
+    summary = _get_db().get_daily_summary(date)
+    return summary if summary is not None else DailySummary(date=date)
+
+def get_sessions_for_dates(dates: list[str]) -> list[AppSession]:
+    """See :meth:`Database.get_sessions_for_dates`."""
+    return _get_db().get_sessions_for_dates(dates)
+
+def search_sessions(query: str, dates: list[str] | None = None) -> list[AppSession]:
+    """See :meth:`Database.search_sessions`."""
+    return _get_db().search_sessions(query, dates)
+
+def get_history_stats(dates: list[str]) -> dict[str, int]:
+    """See :meth:`Database.get_history_stats`."""
+    return _get_db().get_history_stats(dates)
+
+def export_history_csv(dates: list[str], target_path: str) -> None:
+    """See :meth:`Database.export_history_csv`."""
+    _get_db().export_history_csv(dates, target_path)
+
+def export_history_json(dates: list[str], target_path: str) -> None:
+    """See :meth:`Database.export_history_json`."""
+    _get_db().export_history_json(dates, target_path)
+
+def get_active_session() -> Optional[AppSession]:
+    """See :meth:`Database.get_active_session`."""
+    return _get_db().get_active_session()
+
+def get_top_apps(dates: list[str], limit: int = config.TOP_APPS_LIMIT) -> list[tuple[str, int]]:
+    """See :meth:`Database.get_top_apps`."""
+    return _get_db().get_top_apps(dates, limit=limit)
+
+def reconcile_orphaned_sessions() -> None:
+    """See :meth:`Database.reconcile_orphaned_sessions`."""
+    _get_db().reconcile_orphaned_sessions()
+
+def checkpoint_and_close() -> None:
+    """See :meth:`Database.checkpoint_and_close`."""
+    _get_db().checkpoint_and_close()

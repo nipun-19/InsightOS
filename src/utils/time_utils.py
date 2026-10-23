@@ -112,6 +112,19 @@ def date_range_strings(days: int) -> list[str]:
     return [days_ago_str(n) for n in range(days - 1, -1, -1)]
 
 
+def previous_day_str(base_day: str, offset: int) -> str:
+    """Return a date string offset from a supplied local date string."""
+    base_date = datetime.strptime(base_day, "%Y-%m-%d").date()
+    target = base_date - timedelta(days=offset)
+    return target.strftime("%Y-%m-%d")
+
+
+def format_iso_time(timestamp: str) -> str:
+    """Return a compact local time string like 09:14 for display."""
+    parsed = parse_iso(timestamp)
+    return to_local(parsed).strftime("%H:%M")
+
+
 def format_duration(seconds: int) -> str:
     """Format a duration in seconds as a short "Xh Ym" style string.
 
