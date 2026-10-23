@@ -1,3 +1,4 @@
+import re
 import sys
 from pathlib import Path
 
@@ -11,16 +12,27 @@ from main import _sync_autostart_from_settings
 def test_per_user_installer_removes_only_insightos_run_value_on_uninstall() -> None:
     installer_script = config.BASE_DIR / "build" / "InsightOS.iss"
     content = installer_script.read_text(encoding="utf-8")
+    code_section = content.split("[Code]", maxsplit=1)[1]
+    uninstall_hook = re.search(
+        r"procedure CurUninstallStepChanged\(CurUninstallStep: TUninstallStep\);"
+        r"(.*?)\nend;",
+        code_section,
+        flags=re.DOTALL,
+    )
 
     assert "PrivilegesRequired=lowest" in content
     assert r"DefaultDirName={localappdata}\Programs\InsightOS" in content
     assert "{userprograms}" in content
     assert "{userdesktop}" in content
-    assert "CurUninstallStep = usUninstall" in content
-    assert "RegDeleteValue(" in content
-    assert "HKEY_CURRENT_USER" in content
-    assert "'Software\\Microsoft\\Windows\\CurrentVersion\\Run'" in content
-    assert "'InsightOS'" in content
+    assert uninstall_hook is not None
+    normalized_hook = re.sub(r"\s+", " ", uninstall_hook.group(1)).strip()
+    assert normalized_hook == (
+        "begin if CurUninstallStep = usUninstall then RegDeleteValue("
+        " HKEY_CURRENT_USER, "
+        "'Software\\Microsoft\\Windows\\CurrentVersion\\Run', 'InsightOS');"
+    )
+    assert code_section.count("RegDeleteValue(") == 1
+    assert "RegDeleteKey(" not in code_section
     assert "DelTree(" not in content
     assert "[UninstallDelete]" not in content
     assert r"{localappdata}\InsightOS" not in content
@@ -152,5 +164,35 @@ def test_uninstall_preserves_opt_in_setting_and_reinstall_restores_run_value(
             "InsightOS": '"C:\\InsightOS.exe"',
         }
         assert settings_store.get_value("widget_auto_start") is True
+    finally:
+        config.SETTINGS_FILE_PATH = original_path
+
+
+def test_uninstall_and_reinstall_keep_disabled_autostart_disabled(
+    monkeypatch, tmp_path
+) -> None:
+    settings_path = tmp_path / "settings.json"
+    original_path = config.SETTINGS_FILE_PATH
+    values = {
+        "OtherApp": '"C:\\OtherApp.exe"',
+        "InsightOS": '"C:\\OldInsightOS.exe"',
+    }
+    _install_fake_registry(monkeypatch, values)
+
+    try:
+        config.SETTINGS_FILE_PATH = settings_path
+        settings_store.set_value("widget_auto_start", False)
+
+        # The installer hook removes only InsightOS; settings remain separate.
+        del values["InsightOS"]
+
+        assert settings_store.get_value("widget_auto_start") is False
+        assert values == {"OtherApp": '"C:\\OtherApp.exe"'}
+
+        # First startup after reinstall must not recreate an opted-out entry.
+        _sync_autostart_from_settings()
+
+        assert values == {"OtherApp": '"C:\\OtherApp.exe"'}
+        assert settings_store.get_value("widget_auto_start") is False
     finally:
         config.SETTINGS_FILE_PATH = original_path
